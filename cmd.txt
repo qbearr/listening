@@ -1,1 +1,1 @@
-whoami
+echo "Hello from the beacon"
